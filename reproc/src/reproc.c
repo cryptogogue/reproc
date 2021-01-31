@@ -415,29 +415,18 @@ int reproc_poll(reproc_event_source *sources, size_t num_sources, int timeout)
     bool again = false;
 
     for (size_t i = 0; i < num_sources; i++) {
+      int q = -1;
+
       if (!(sources[i].events & REPROC_EVENT_EXIT)) {
         continue;
       }
 
-      reproc_t *process = sources[i].process;
-
-      if (process->child.out == PIPE_INVALID &&
-          process->child.err == PIPE_INVALID) {
-        continue;
-      }
-
-      r = pipe_shutdown(process->child.out);
-      if (r < 0) {
+      q = reproc_wait(sources[i].process, REPROC_INFINITE);
+      if (q < 0) {
+        r = q;
         goto finish;
       }
 
-      r = pipe_shutdown(process->child.err);
-      if (r < 0) {
-        goto finish;
-      }
-
-      process->child.out = pipe_destroy(process->child.out);
-      process->child.err = pipe_destroy(process->child.err);
       again = true;
     }
 
@@ -545,6 +534,27 @@ int reproc_close(reproc_t *process, REPROC_STREAM stream)
   return REPROC_EINVAL;
 }
 
+static int destroy_exit_pipe(reproc_t *process)
+{
+  int r = -1;
+  int q = -1;
+
+  process->pipe.exit = pipe_destroy(process->pipe.exit);
+
+  if (process->child.out == PIPE_INVALID &&
+      process->child.err == PIPE_INVALID) {
+    return 0;
+  }
+
+  r = pipe_shutdown(process->child.out);
+  q = pipe_shutdown(process->child.err);
+
+  process->child.out = pipe_destroy(process->child.out);
+  process->child.err = pipe_destroy(process->child.err);
+
+  return r < 0 ? r : q < 0 ? q : 1;
+}
+
 int reproc_wait(reproc_t *process, int timeout)
 {
   ASSERT_EINVAL(process);
@@ -566,14 +576,14 @@ int reproc_wait(reproc_t *process, int timeout)
     }
   }
 
-  ASSERT(process->pipe.exit != PIPE_INVALID);
+  if (timeout != REPROC_INFINITE) {
+    pipe_event_source source = { .pipe = process->pipe.exit,
+                                 .interests = PIPE_EVENT_IN };
 
-  pipe_event_source source = { .pipe = process->pipe.exit,
-                               .interests = PIPE_EVENT_IN };
-
-  r = pipe_poll(&source, 1, timeout);
-  if (r <= 0) {
-    return r == 0 ? REPROC_ETIMEDOUT : r;
+    r = pipe_poll(&source, 1, timeout);
+    if (r <= 0) {
+      return r == 0 ? REPROC_ETIMEDOUT : r;
+    }
   }
 
   r = process_wait(process->handle);
@@ -581,9 +591,14 @@ int reproc_wait(reproc_t *process, int timeout)
     return r;
   }
 
-  process->pipe.exit = pipe_destroy(process->pipe.exit);
+  process->status = r;
 
-  return process->status = r;
+  r = destroy_exit_pipe(process);
+  if (r < 0) {
+    return r;
+  }
+
+  return process->status;
 }
 
 int reproc_terminate(reproc_t *process)
